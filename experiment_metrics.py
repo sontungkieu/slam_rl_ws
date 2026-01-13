@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import time
+import atexit
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, List, Optional, Tuple
@@ -94,28 +95,37 @@ class HogProc:
     name: str
 
 
-class RateTracker:
+class HzStatsTracker:
     def __init__(self, window_s: float):
         self.window_s = window_s
-        self.times: Deque[float] = deque()
+        self.last_t: Optional[float] = None
+        self.samples: Deque[Tuple[float, float]] = deque()  # (t_now, dt)
 
-    def add(self, t: float):
-        self.times.append(t)
-        self._prune(t)
+    def add(self, t_now: float):
+        if self.last_t is not None:
+            dt = t_now - self.last_t
+            if dt > 0:
+                self.samples.append((t_now, dt))
+        self.last_t = t_now
+        self._prune(t_now)
 
     def _prune(self, t_now: float):
         cutoff = t_now - self.window_s
-        while self.times and self.times[0] < cutoff:
-            self.times.popleft()
+        while self.samples and self.samples[0][0] < cutoff:
+            self.samples.popleft()
 
-    def rate_hz(self, t_now: float) -> float:
+    def stats(self, t_now: float) -> Tuple[float, float, float, float, int]:
         self._prune(t_now)
-        if len(self.times) < 2:
-            return 0.0
-        dt = self.times[-1] - self.times[0]
-        if dt <= 1e-9:
-            return 0.0
-        return (len(self.times) - 1) / dt
+        if not self.samples:
+            return 0.0, float("nan"), float("nan"), float("nan"), 0
+        dts = [dt for _, dt in self.samples]
+        mean_dt = sum(dts) / len(dts)
+        rate_hz = (1.0 / mean_dt) if mean_dt > 1e-9 else 0.0
+        mn = min(dts)
+        mx = max(dts)
+        var = sum((dt - mean_dt) ** 2 for dt in dts) / len(dts)
+        std = math.sqrt(var)
+        return rate_hz, mn, mx, std, len(dts)
 
 
 class ExperimentNode(Node):
@@ -163,13 +173,21 @@ class ExperimentNode(Node):
         self.sub_map = self.create_subscription(OccupancyGrid, "/map", self.on_map, map_qos)
 
         # Track rates based on arrival times
-        self.scan_rate = RateTracker(window_s)
-        self.map_rate = RateTracker(window_s)
+        self.scan_rate = HzStatsTracker(window_s)
+        self.map_rate  = HzStatsTracker(window_s)
+
 
         self.last_scan_stamp = None
         self.last_map_stamp = None
 
         self.t0 = now_mono()
+        # Unique id per run so we can clean only hogs created by this run
+        self.run_id = str(os.getpid())
+
+        # Ensure cleanup even if user Ctrl+C or plot crashes
+        atexit.register(self._force_cleanup_all_hogs, "atexit")
+        signal.signal(signal.SIGINT, self._sig_handler)
+        signal.signal(signal.SIGTERM, self._sig_handler)
         self.events: List[Tuple[float, str]] = []  # (t_rel, label)
         self.hogs: List[HogProc] = []
         self.next_hog_idx = 0
@@ -181,15 +199,28 @@ class ExperimentNode(Node):
         self.csv_w.writerow([
             "t_rel_s",
             "sim_time_s",
+
             "scan_hz",
+            "scan_dt_min_s",
+            "scan_dt_max_s",
+            "scan_dt_std_s",
+            "scan_window_n",
+
             "map_hz",
+            "map_dt_min_s",
+            "map_dt_max_s",
+            "map_dt_std_s",
+            "map_window_n",
+
             "scan_age_s",
             "map_age_s",
+
             "cpu_slam_percent",
             "cpu_bridge_percent",
             "cpu_hog_total_percent",
             "hog_count",
         ])
+
 
         # In-memory for plotting
         self.rows = []
@@ -209,6 +240,15 @@ class ExperimentNode(Node):
             psutil.cpu_percent(interval=None)
 
         self.timer = self.create_timer(self.log_period_s, self.tick)
+
+    def _sig_handler(self, signum, frame):
+        self.get_logger().warn(f"Received signal {signum}, cleaning up hogs...")
+        self._force_cleanup_all_hogs(f"signal {signum}")
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
 
     def on_scan(self, msg: LaserScan):
         t = now_mono()
@@ -231,24 +271,114 @@ class ExperimentNode(Node):
         if stamp is None:
             return float("nan")
         return self._ros_time_sec() - self._stamp_to_sec(stamp)
+    
+    def _force_cleanup_all_hogs(self, reason: str):
+        # Kill only hogs created by THIS run_id (by node name prefix), plus any popens we tracked.
+        self.get_logger().warn(f"Cleaning up hogs ({reason})... count={len(self.hogs)}")
+
+        # 1) kill what we spawned (robust)
+        for h in list(self.hogs):
+            try:
+                self._kill_popen_group(h.popen, h.name, timeout_s=2.0)
+            except Exception:
+                pass
+
+        # 2) also pkill by unique node name prefix (in case popen list got lost)
+        try:
+            subprocess.call(["pkill", "-f", f"__node:=cpu_hog_{self.run_id}_"])
+        except Exception:
+            pass
+
+        # prune list
+        alive = []
+        for h in self.hogs:
+            if h.popen.poll() is None:
+                alive.append(h)
+        self.hogs = alive
 
     def _start_hog(self, load: float, idx: int):
-        name = f"cpu_hog_{idx}_{int(load*100):02d}"
+        name = f"cpu_hog_{self.run_id}_{idx}_{int(load*100):02d}"
         cmd = [
             "ros2", "run", "rl_resource_manager", "cpu_hog",
             "--ros-args",
             "-p", f"load:={load}",
             "-r", f"__node:={name}",
         ]
+
         if self.dry_run:
             self.get_logger().info(f"[DRY RUN] would start: {' '.join(cmd)}")
             self.events.append((now_mono() - self.t0, f"hog {idx} load={load}"))
             return
 
-        p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        logdir = os.path.join(os.path.dirname(self.out_csv) or ".", "hog_logs")
+        os.makedirs(logdir, exist_ok=True)
+        stdout_f = open(os.path.join(logdir, f"{name}.out"), "w")
+        stderr_f = open(os.path.join(logdir, f"{name}.err"), "w")
+
+        # start_new_session=True => new process group (killpg will kill the whole group)
+        p = subprocess.Popen(
+            cmd,
+            stdout=stdout_f,
+            stderr=stderr_f,
+            start_new_session=True,
+        )
+
         self.hogs.append(HogProc(popen=p, load=load, start_t=now_mono(), name=name))
         self.events.append((now_mono() - self.t0, f"hog {idx} load={load}"))
         self.get_logger().info(f"Started {name} (pid={p.pid}) load={load}")
+    
+    def _kill_popen_group(self, p: subprocess.Popen, label: str, timeout_s: float = 2.0):
+        if p is None:
+            return
+
+        if p.poll() is not None:
+            return  # already exited
+
+        try:
+            pgid = os.getpgid(p.pid)
+        except Exception:
+            pgid = None
+
+        # Try graceful stop
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGINT)
+            else:
+                p.send_signal(signal.SIGINT)
+        except Exception:
+            pass
+
+        # Wait a bit
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if p.poll() is not None:
+                return
+            time.sleep(0.05)
+
+        # Escalate to SIGTERM
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                p.terminate()
+        except Exception:
+            pass
+
+        t0 = time.time()
+        while time.time() - t0 < timeout_s:
+            if p.poll() is not None:
+                return
+            time.sleep(0.05)
+
+        # Final: SIGKILL
+        try:
+            if pgid is not None:
+                os.killpg(pgid, signal.SIGKILL)
+            else:
+                p.kill()
+        except Exception:
+            pass
+
 
     def _cpu_of_pid(self, pid: Optional[int], label: str = "") -> float:
         if pid is None:
@@ -314,8 +444,8 @@ class ExperimentNode(Node):
 
 
         # Compute metrics
-        scan_hz = self.scan_rate.rate_hz(t_now)
-        map_hz = self.map_rate.rate_hz(t_now)
+        scan_hz, scan_dt_min, scan_dt_max, scan_dt_std, scan_n = self.scan_rate.stats(t_now)
+        map_hz,  map_dt_min,  map_dt_max,  map_dt_std,  map_n  = self.map_rate.stats(t_now)
         scan_age = self._age_sec(self.last_scan_stamp)
         map_age = self._age_sec(self.last_map_stamp)
 
@@ -329,15 +459,28 @@ class ExperimentNode(Node):
         row = [
             t_rel,
             sim_time,
+
             scan_hz,
+            scan_dt_min,
+            scan_dt_max,
+            scan_dt_std,
+            float(scan_n),
+
             map_hz,
+            map_dt_min,
+            map_dt_max,
+            map_dt_std,
+            float(map_n),
+
             scan_age,
             map_age,
+
             cpu_slam,
             cpu_bridge,
             cpu_hogs,
-            len(self.hogs),
+            float(len(self.hogs)),
         ]
+
         self.csv_w.writerow([f"{x:.6f}" if isinstance(x, float) else x for x in row])
         self.csv_f.flush()
         self.rows.append(row)
@@ -346,6 +489,8 @@ class ExperimentNode(Node):
             self._last_debug_log_t = t_rel
             self.get_logger().info(
                 f"t={t_rel:.1f}s scan={scan_hz:.2f}Hz map={map_hz:.2f}Hz | "
+                f"scan: {scan_hz:.2f}Hz dt[min={scan_dt_min:.3f} max={scan_dt_max:.3f} std={scan_dt_std:.3f}] n={scan_n} | "
+                f"map: {map_hz:.2f}Hz dt[min={map_dt_min:.3f} max={map_dt_max:.3f} std={map_dt_std:.3f}] n={map_n} | "
                 f"cpu slam={cpu_slam:.1f}% bridge={cpu_bridge:.1f}% hog_total={cpu_hogs:.1f}% "
                 f"hogs={len(self.hogs)}"
             )
@@ -362,25 +507,19 @@ class ExperimentNode(Node):
             self._shutdown()
 
     def _shutdown(self):
-        # terminate hogs
-        for h in self.hogs:
-            try:
-                h.popen.send_signal(signal.SIGINT)
-            except Exception:
-                pass
-        time.sleep(0.3)
-        for h in self.hogs:
-            try:
-                h.popen.terminate()
-            except Exception:
-                pass
+        # 1) Stop/kill all hogs robustly (kill whole process groups)
+        try:
+            self._force_cleanup_all_hogs("normal shutdown")
+        except Exception as e:
+            self.get_logger().warn(f"Cleanup hogs failed: {e}")
 
+        # 2) Close CSV
         try:
             self.csv_f.close()
         except Exception:
             pass
 
-        # Plot
+        # 3) Plot
         try:
             self._plot()
             self.get_logger().info(f"Saved CSV: {self.out_csv}")
@@ -388,54 +527,92 @@ class ExperimentNode(Node):
         except Exception as e:
             self.get_logger().error(f"Plot failed: {e}")
 
-        # end ROS
-        rclpy.shutdown()
+        # 4) End ROS
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
+
 
     def _plot(self):
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
+        import csv
+        import os
+        import math
 
-        t = [r[0] for r in self.rows]
-        scan = [r[2] for r in self.rows]
-        mapp = [r[3] for r in self.rows]
-        cpu_slam = [r[6] for r in self.rows]
-        cpu_hogs = [r[8] for r in self.rows]
+        # --- Read CSV back by column names (robust to column order changes) ---
+        t = []
+        scan_hz = []
+        map_hz = []
+        scan_dt_std = []
+        map_dt_std = []
+        cpu_slam = []
+        cpu_hogs = []
 
-        fig = plt.figure(figsize=(12, 8))
+        with open(self.out_csv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for r in reader:
+                def g(key, default=float("nan")):
+                    try:
+                        return float(r.get(key, default))
+                    except Exception:
+                        return default
 
-        ax1 = fig.add_subplot(3, 1, 1)
-        ax1.plot(t, scan, label="/scan rate (Hz)")
+                t.append(g("t_rel_s"))
+                scan_hz.append(g("scan_hz"))
+                map_hz.append(g("map_hz"))
+                scan_dt_std.append(g("scan_dt_std_s"))
+                map_dt_std.append(g("map_dt_std_s"))
+                cpu_slam.append(g("cpu_slam_percent"))
+                cpu_hogs.append(g("cpu_hog_total_percent"))
+
+        fig = plt.figure(figsize=(12, 10))
+
+        ax1 = fig.add_subplot(4, 1, 1)
+        ax1.plot(t, scan_hz, label="/scan rate (Hz)")
         ax1.set_ylabel("Hz")
-        ax1.set_title("Topic rates + CPU load steps")
+        ax1.set_title("Topic rates + jitter + CPU load steps")
         ax1.grid(True)
 
-        ax2 = fig.add_subplot(3, 1, 2, sharex=ax1)
-        ax2.plot(t, mapp, label="/map rate (Hz)")
+        ax2 = fig.add_subplot(4, 1, 2, sharex=ax1)
+        ax2.plot(t, map_hz, label="/map rate (Hz)")
         ax2.set_ylabel("Hz")
         ax2.grid(True)
 
-        ax3 = fig.add_subplot(3, 1, 3, sharex=ax1)
-        ax3.plot(t, cpu_slam, label="slam_toolbox CPU%")
-        ax3.plot(t, cpu_hogs, label="cpu_hog total CPU%")
-        ax3.set_xlabel("time since start (s)")
-        ax3.set_ylabel("CPU %")
+        ax3 = fig.add_subplot(4, 1, 3, sharex=ax1)
+        ax3.plot(t, scan_dt_std, label="/scan dt std (s)")
+        ax3.plot(t, map_dt_std, label="/map dt std (s)")
+        ax3.set_ylabel("std of dt (s)")
         ax3.grid(True)
+
+        ax4 = fig.add_subplot(4, 1, 4, sharex=ax1)
+        ax4.plot(t, cpu_slam, label="slam_toolbox CPU%")
+        ax4.plot(t, cpu_hogs, label="cpu_hog total CPU%")
+        ax4.set_xlabel("time since start (s)")
+        ax4.set_ylabel("CPU %")
+        ax4.grid(True)
 
         # Red vertical lines for hog start events
         for (te, label) in self.events:
-            for ax in (ax1, ax2, ax3):
+            for ax in (ax1, ax2, ax3, ax4):
                 ax.axvline(te, color="red", linestyle="--", linewidth=1)
-            ax1.text(te, max(scan) if scan else 0.0, label, rotation=90, va="bottom", fontsize=8)
+            # annotate only on top subplot
+            y = max([v for v in scan_hz if math.isfinite(v)] + [0.0])
+            ax1.text(te, y, label, rotation=90, va="bottom", fontsize=8)
 
         ax1.legend(loc="upper right")
         ax2.legend(loc="upper right")
         ax3.legend(loc="upper right")
+        ax4.legend(loc="upper right")
 
         os.makedirs(os.path.dirname(self.out_png) or ".", exist_ok=True)
         fig.tight_layout()
         fig.savefig(self.out_png, dpi=160)
         plt.close(fig)
+
+
 
 
 def main():
