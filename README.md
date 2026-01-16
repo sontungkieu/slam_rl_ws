@@ -1,83 +1,97 @@
-# slam_rl_ws (ROS2 Jazzy)
-Minimal workspace for SLAM + reactive exploration + RL-based resource management. Components:
-- `tb3_reactive_explorer`: `/scan` → `/cmd_vel` obstacle avoidance + wandering.
-- `mini_mapper`: demo occupancy-grid mapper using `/odom` + `/scan`, publishes `/mini_map`.
-- `rl_resource_manager`: online Q-learning that changes OS nice of `cpu_hog`, `rviz2`, `reactive_explorer` to protect SLAM; includes `cpu_hog` node to create contention.
-- `experiment_metrics.py`: standalone script to measure `/scan` and `/map` rates, jitter, stamp age, and CPU% while spinning up multiple `cpu_hog` loads, writing CSV + plot.
+# SLAM & RL Resource Manager Workspace (ROS 2 Jazzy)
 
-## Build
+A workspace for SLAM, reactive exploration, and RL-based resource management on TurtleBot3.
+
+## Components
+
+- **`tb3_reactive_explorer`**: Obstacle avoidance and random wandering (`/scan` → `/cmd_vel`).
+- **`mini_mapper`**: Simple occupancy-grid mapper (`/odom` + `/scan` → `/mini_map`).
+- **`rl_resource_manager`**: Q-learning agent managing system resources (nice values) to profiling SLAM performance under load.
+- **`experiment_metrics.py`**: Benchmarking script for measuring jitter, stamp age, and resource usage.
+
+## Setup & Build
+
 ```bash
-mkdir -p ~/slam_rl_ws/src
-# copy packages into ~/slam_rl_ws/src
-cd ~/slam_rl_ws
+# 1. Source ROS 2 Jazzy
 source /opt/ros/jazzy/setup.bash
+
+# 2. Build the workspace
+cd ~/slam_rl_ws
 colcon build --symlink-install
+
+# 3. Source the workspace
 source ~/slam_rl_ws/install/setup.bash
 ```
 
-## Run (typical TurtleBot3 Gazebo)
-Terminal 1 (sim):
+## Running the System
+
+Open multiple terminals to run the components.
+
+### Terminal 1: Simulation (Gazebo)
 ```bash
 export TURTLEBOT3_MODEL=burger
 ros2 launch turtlebot3_gazebo turtlebot3_world.launch.py
 ```
 
-Terminal 2 (SLAM):
+### Terminal 2: SLAM (SLAM Toolbox)
+Basic launch:
 ```bash
 ros2 launch slam_toolbox online_async_launch.py
 ```
-
-Terminal 3 (explorer):
+Or with custom simulation time and parameters:
 ```bash
-ros2 run tb3_reactive_explorer reactive_explorer
-# or with params:
+ros2 launch slam_toolbox online_async_launch.py \
+  use_sim_time:=true \
+  slam_params_file:=$(pwd)/mapper_params_online_async.yaml
+```
+*(Note: Run this from the workspace root where the params file is located)*
+
+### Terminal 3: Explorer Agent
+Runs the reactive exploration node to fetch sensor data and drive the robot.
+```bash
 ros2 run tb3_reactive_explorer reactive_explorer --ros-args \
   -p use_sim_time:=true \
-  -p forward_speed:=0.10 \
-  -p turn_speed:=0.45 \
-  -p avoid_front:=0.65 \
-  -p avoid_side:=0.50 \
-  -p wander_turn_every_s:=12.0 \
-  -p wander_turn_duration_s:=0.8
+  -p forward_speed:=0.15 \
+  -p turn_speed:=0.5 \
+  -p avoid_front:=0.5 \
+  -p wander_turn_every_s:=10.0
 ```
 
-Terminal 4 (optional mini mapper):
+### Terminal 4: Resource Manager & CPU Load (RL)
+Run the resource manager to adaptively control process priorities:
 ```bash
-ros2 run mini_mapper mini_mapper
-```
-
-Terminal 5 (optional RL resource manager + hog):
-```bash
-ros2 run rl_resource_manager cpu_hog --ros-args -p load:=0.9
 ros2 run rl_resource_manager rl_resource_manager
 ```
 
-RViz: `ros2 run rviz2 rviz2`
+Run a background CPU stress node ("Hog") to induce load:
+```bash
+ros2 run rl_resource_manager cpu_hog --ros-args -p load:=0.8
+```
 
-## Experiment metrics
-Measure topic performance while gradually adding CPU load.
+### Terminal 5: Visualization
+```bash
+ros2 run rviz2 rviz2
+```
+*Tip: In RViz, set Fixed Frame to `map` and add the `/map` and `/scan` topics.*
+
+---
+
+## Running Experiments
+
+Use the provided script to run a controlled experiment measuring SLAM performance under increasing load.
+
 ```bash
 cd ~/slam_rl_ws
 python3 experiment_metrics.py \
-  --loads 0.6,0.8,0.9 \
-  --start-after 10 \
-  --step 20 \
-  --duration 120 \
-  --log-period 0.2 \
-  --window 5.0 \
-  --outdir metrics_out \
-  --slam-regex "slam_toolbox" \
-  --bridge-regex "ros_gz_bridge"
+  --loads 0.0,0.5,0.8,0.95 \
+  --start-after 5 \
+  --step 30 \
+  --duration 150 \
+  --outdir metrics_out
 ```
-- Spawns `cpu_hog` nodes over time, tracks `/scan` and `/map` rate/jitter, stamp age, CPU% (slam_toolbox, ros_gz_bridge, hog total).
-- Outputs CSV and PNG plot to `metrics_out/<timestamp>.{csv,png}` (use `--prefix` to override). Add `--dry-run` to skip starting hogs but still log topic stats.
 
-## Save map (from `/map`)
+### Saving the Map
+To save the generated map to disk:
 ```bash
-mkdir -p ~/robot_maps
-ros2 run nav2_map_server map_saver_cli -f ~/robot_maps/my_map
+ros2 run nav2_map_server map_saver_cli -f ~/my_map
 ```
-
-## RViz tips
-- For raw scan test: Fixed Frame `odom`, add `/scan` LaserScan.
-- For SLAM map: Fixed Frame `map`, add `/map` Map display.
