@@ -4,6 +4,7 @@ import csv
 import math
 import os
 import re
+import json
 import signal
 import subprocess
 import time
@@ -20,55 +21,13 @@ from rclpy.qos import qos_profile_sensor_data, QoSProfile, ReliabilityPolicy, Du
 
 from nav_msgs.msg import OccupancyGrid
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
 
 # Optional: psutil for better CPU metrics (fallback to `ps` if not installed)
 try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
-
-
-def wait_child_pid(ppid: int, pattern: str, timeout_s: float = 2.0) -> Optional[int]:
-    """
-    Find a child PID of ppid whose cmdline matches pattern.
-    Works for "ros2 run ..." wrapper spawning the real executable.
-    """
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        try:
-            out = subprocess.check_output(
-                ["pgrep", "-P", str(ppid), "-f", pattern],
-                text=True
-            ).strip().splitlines()
-            if out:
-                return int(out[0].strip())
-        except subprocess.CalledProcessError:
-            pass
-        time.sleep(0.05)
-    return None
-
-
-# ---- CPU% via /proc (robust, no psutil needed) ----
-CLK_TCK = os.sysconf(os.sysconf_names["SC_CLK_TCK"])
-
-def read_proc_cpu_seconds(pid: int) -> float:
-    """
-    Return (utime+stime) in seconds from /proc/<pid>/stat
-    """
-    with open(f"/proc/{pid}/stat", "r") as f:
-        s = f.read()
-
-    # /proc/<pid>/stat: field 2 is comm in parentheses (may contain spaces)
-    rparen = s.rfind(")")
-    rest = s[rparen + 2:]  # skip ") "
-    fields = rest.split()
-
-    # After comm, fields[0] corresponds to field 3 (state)
-    # utime is field 14, stime is field 15 => indexes 14-3=11 and 12
-    utime = int(fields[11])
-    stime = int(fields[12])
-    return (utime + stime) / float(CLK_TCK)
-
 
 def now_mono() -> float:
     return time.monotonic()
@@ -101,23 +60,6 @@ def ps_cpu_percent(pid: int) -> float:
     except Exception:
         return float("nan")
 
-
-def find_pid_by_regex(pattern: str) -> Optional[int]:
-    """Find first PID whose cmdline matches regex (best-effort)."""
-    try:
-        out = subprocess.check_output(["ps", "-eo", "pid,args"], text=True)
-        rx = re.compile(pattern)
-        for line in out.splitlines()[1:]:
-            line = line.strip()
-            if not line:
-                continue
-            pid_str, args = line.split(None, 1)
-            if rx.search(args):
-                return int(pid_str)
-    except Exception:
-        pass
-    return None
-
 def pgrep_one(pattern: str) -> Optional[int]:
     """Return one PID matching pattern via pgrep -f (best-effort)."""
     try:
@@ -130,6 +72,47 @@ def pgrep_one(pattern: str) -> Optional[int]:
     except Exception:
         return None
 
+def pick_best_pid_for_node(node_name: str, timeout_s: float = 3.0) -> Optional[int]:
+    """
+    Wait up to timeout_s for the REAL process (installed cpu_hog) to appear.
+    Only if timeout -> fallback to wrapper PID.
+    """
+    deadline = time.time() + timeout_s
+    pat = f"__node:={node_name}"
+    wrapper_pid = None
+
+    while time.time() < deadline:
+        try:
+            lines = subprocess.check_output(["pgrep", "-fa", pat], text=True).splitlines()
+        except subprocess.CalledProcessError:
+            lines = []
+
+        found_real = None
+        wrapper_pid = None
+
+        for ln in lines:
+            try:
+                pid = int(ln.split(None, 1)[0])
+                cmd = ln.split(None, 1)[1] if " " in ln else ""
+            except Exception:
+                continue
+
+            # ưu tiên PID thật
+            if "/install/rl_resource_manager/lib/rl_resource_manager/cpu_hog" in cmd:
+                found_real = pid
+                break
+
+            # nhớ wrapper để fallback
+            if " ros2 run rl_resource_manager cpu_hog " in cmd or "/opt/ros/" in cmd and "ros2 run" in cmd:
+                wrapper_pid = pid
+
+        if found_real is not None:
+            return found_real
+
+        # thấy wrapper nhưng chưa thấy real -> chờ thêm, đừng return vội
+        time.sleep(0.05)
+
+    return wrapper_pid
 
 
 @dataclass
@@ -220,6 +203,7 @@ class ExperimentNode(Node):
         )
         self.sub_scan = self.create_subscription(LaserScan, "/scan", self.on_scan, qos_profile_sensor_data)
         self.sub_map = self.create_subscription(OccupancyGrid, "/map", self.on_map, map_qos)
+        self.sub_hog_status = self.create_subscription(String, "/cpu_hog_status", self.on_hog_status, 10)
 
         # Track rates based on arrival times
         self.scan_rate = HzStatsTracker(window_s)
@@ -290,48 +274,30 @@ class ExperimentNode(Node):
 
         self.timer = self.create_timer(self.log_period_s, self.tick)
     
-    def _cpu_pct(self, pid: Optional[int]) -> float:
-        """
-        CPU% of a process since last sample:
-        (delta_cpu_time / delta_wall_time) * 100
-        100% ~= full 1 core.
-        """
-        if pid is None:
-            return float("nan")
-
-        wall = time.monotonic()
-        try:
-            cpu_s = read_proc_cpu_seconds(pid)
-        except FileNotFoundError:
-            # process ended
-            self._cpu_last.pop(pid, None)
-            return float("nan")
-        except Exception:
-            return float("nan")
-
-        prev = self._cpu_last.get(pid)
-        self._cpu_last[pid] = (wall, cpu_s)
-
-        if prev is None:
-            # first sample is baseline
-            return float("nan")
-
-        prev_wall, prev_cpu = prev
-        dw = wall - prev_wall
-        dc = cpu_s - prev_cpu
-        if dw <= 1e-9:
-            return float("nan")
-        if dc < 0:
-            return float("nan")
-
-        return (dc / dw) * 100.0
-
-
     def _sig_handler(self, signum, frame):
         self.get_logger().warn(f"Received signal {signum}, cleaning up hogs...")
         self._force_cleanup_all_hogs(f"signal {signum}")
         try:
             rclpy.shutdown()
+        except Exception:
+            pass
+
+    def on_hog_status(self, msg: String):
+        try:
+            data = json.loads(msg.data)
+            name = data.get("name")
+            pid = data.get("pid")
+            if name and pid:
+                # Update PID in self.hogs
+                for h in self.hogs:
+                    if h.name == name:
+                        # Found the hog
+                        if getattr(h, "cpu_pid", None) != pid:
+                            self.get_logger().info(f"Updated PID for {name}: {h.cpu_pid} -> {pid} (via topic)")
+                            h.cpu_pid = pid
+                            # Reset proc cache for this PID so we pick up new process
+                            self._proc_cache.pop(pid, None)
+                        break
         except Exception:
             pass
 
@@ -410,7 +376,7 @@ class ExperimentNode(Node):
         )
 
         # IMPORTANT: p.pid is wrapper "ros2 run", we want the real child hog PID
-        child = wait_child_pid(p.pid, f"__node:={name}", timeout_s=2.0)
+        child = pick_best_pid_for_node(name, timeout_s=5.0)
         cpu_pid = child if child is not None else p.pid
 
         self.hogs.append(HogProc(popen=p, load=load, start_t=now_mono(), name=name, cpu_pid=cpu_pid))
